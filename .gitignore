@@ -37,4 +37,5 @@ stratum-mcp.exe
 stratum-mcp-mac
 stratum-mcp-linux
 stratum-mcp-win
+bin/stratum-mcp-*
 
