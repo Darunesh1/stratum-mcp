@@ -1,0 +1,34 @@
+{
+  "name": "stratum-mcp",
+  "version": "1.0.0",
+  "description": "Model Context Protocol (MCP) server standalone for Stratum",
+  "main": "bin/index.js",
+  "bin": {
+    "stratum-mcp": "bin/index.js"
+  },
+  "scripts": {
+    "build": "bash scripts/build-binaries.sh",
+    "test": "echo \"Error: no test specified\" && exit 0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Darunesh1/stratum-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "stratum",
+    "bibliographic",
+    "duckdb",
+    "openalex"
+  ],
+  "author": "Darunesh1",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Darunesh1/stratum-mcp/issues"
+  },
+  "homepage": "https://github.com/Darunesh1/stratum-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
