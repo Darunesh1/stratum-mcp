@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Stratum MCP Binaries
+stratum-mcp
+stratum-mcp.exe
+stratum-mcp-mac
+stratum-mcp-linux
+stratum-mcp-win
+bin/stratum-mcp-*
+

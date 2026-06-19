@@ -1,0 +1,94 @@
+name: Build and Publish NPM Package
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-binaries:
+    name: Build Binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23' # Matches project version requirements
+
+      - name: Install dependencies
+        run: go get -v ./...
+
+      - name: Build for Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Install cross-compiler for arm64
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          
+          # Build Linux amd64
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o stratum-mcp-linux-amd64 main.go
+          
+          # Build Linux arm64 using cross-compiler
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc go build -o stratum-mcp-linux-arm64 main.go
+
+      - name: Build for macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          # Build macOS amd64
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -o stratum-mcp-darwin-amd64 main.go
+          
+          # Build macOS arm64 (Apple Silicon)
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o stratum-mcp-darwin-arm64 main.go
+
+      - name: Build for Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          # Build Windows amd64
+          go build -o stratum-mcp-windows-amd64.exe main.go
+        env:
+          CGO_ENABLED: 1
+          GOOS: windows
+          GOARCH: amd64
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}
+          path: stratum-mcp-*
+
+  publish-npm:
+    name: Publish to NPM
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: temp-binaries
+
+      - name: Move binaries to bin directory
+        run: |
+          mkdir -p bin
+          # Find all binary files in subdirectories and move them to bin/
+          find temp-binaries -type f -name "stratum-mcp-*" -exec cp {} bin/ \;
+          ls -la bin/
+
+      - name: Publish package to NPM
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
