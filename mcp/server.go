@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -44,12 +46,16 @@ type ValidateResult struct {
 
 // SearchArgs defines the input schema for the search tool.
 type SearchArgs struct {
-	ConfigPath string `json:"config_path,omitempty" jsonschema:"Optional path to the collection.yml config file (default: config/collection.yml)"`
+	ConfigPath   string `json:"config_path,omitempty" jsonschema:"Optional path to the collection.yml config file (default: config/collection.yml)"`
+	CheckAnchors bool   `json:"check_anchors,omitempty" jsonschema:"Optional flag to check anchor DOI coverage (default: false)"`
 }
 
 // SearchResult defines the output schema for the search tool.
 type SearchResult struct {
-	TotalCount int `json:"total_count" jsonschema:"The total number of academic papers matching the query parameters in OpenAlex"`
+	TotalCount     int      `json:"total_count" jsonschema:"The total number of academic papers matching the query parameters in OpenAlex"`
+	AnchorsTotal   int      `json:"anchors_total,omitempty" jsonschema:"Total number of anchors checked"`
+	AnchorsMatched int      `json:"anchors_matched,omitempty" jsonschema:"Number of anchors found in search results"`
+	AnchorsMissing []string `json:"anchors_missing,omitempty" jsonschema:"List of anchor DOIs missing from search results"`
 }
 
 // DownloadArgs defines the input schema for the download tool.
@@ -118,6 +124,11 @@ func (s *MCPServer) RegisterTools() error {
 		Name:        "impute",
 		Description: "Impute missing institution and country metadata using Crossref, LLMs, and PDF text extraction.",
 	}, s.handleImpute)
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "get_topics",
+		Description: "Fetch the distribution of research topics and paper counts matching the keyword filters from OpenAlex.",
+	}, s.handleGetTopics)
 
 	return nil
 }
@@ -213,6 +224,15 @@ func (s *MCPServer) handleSearch(ctx context.Context, req *mcp.CallToolRequest, 
 	}
 
 	keywords := cfg.Keywords
+	if errs := openalex.ValidateKeywords(keywords); len(errs) > 0 {
+		errStr := "keyword validation failed: " + strings.Join(errs, "; ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: errStr},
+			},
+			IsError: true,
+		}, SearchResult{TotalCount: 0}, nil
+	}
 	topics := cfg.Topics
 
 	client := openalex.NewClient(cfg.API.Keys, cfg.API.Email, cfg.Collection.PerPage, cfg.Collection.ConcurrentRequests, cfg.Collection.MaxRetries, cfg.Collection.RetryDelay)
@@ -248,11 +268,68 @@ func (s *MCPServer) handleSearch(ctx context.Context, req *mcp.CallToolRequest, 
 		}, SearchResult{TotalCount: 0}, nil
 	}
 
+	var anchors []string
+	var matchedCount int
+	var missingDOIs []string
+
+	if args.CheckAnchors {
+		for _, a := range cfg.Anchors {
+			norm := normalizeDOI(a)
+			if norm != "" {
+				anchors = append(anchors, norm)
+			}
+		}
+
+		if len(anchors) > 0 {
+			batchSize := 10
+			matchedSet := make(map[string]bool)
+
+			for i := 0; i < len(anchors); i += batchSize {
+				end := i + batchSize
+				if end > len(anchors) {
+					end = len(anchors)
+				}
+				batch := anchors[i:end]
+				batchFilter := strings.Join(batch, "|")
+
+				combinedFilter := filter + ",doi:" + batchFilter
+
+				resp, err := client.FetchPage(ctx, combinedFilter, "*")
+				if err == nil && resp != nil {
+					for _, w := range resp.Results {
+						norm := normalizeDOI(w.DOI)
+						if norm != "" {
+							matchedSet[norm] = true
+						}
+					}
+				}
+			}
+
+			for _, doi := range anchors {
+				if matchedSet[doi] {
+					matchedCount++
+				} else {
+					missingDOIs = append(missingDOIs, doi)
+				}
+			}
+		}
+	}
+
+	text := fmt.Sprintf("Found %d papers matching configuration filters in OpenAlex.", count)
+	if args.CheckAnchors {
+		text += fmt.Sprintf(" Anchor match coverage: %d/%d matches.", matchedCount, len(anchors))
+	}
+
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
-			&mcp.TextContent{Text: fmt.Sprintf("Found %d papers matching configuration filters in OpenAlex.", count)},
+			&mcp.TextContent{Text: text},
 		},
-	}, SearchResult{TotalCount: count}, nil
+	}, SearchResult{
+		TotalCount:     count,
+		AnchorsTotal:   len(anchors),
+		AnchorsMatched: matchedCount,
+		AnchorsMissing: missingDOIs,
+	}, nil
 }
 
 // handleDownload downloads papers matching query filters concurrently and saves them to JSONL.
@@ -497,3 +574,196 @@ func (s *MCPServer) handleImpute(ctx context.Context, req *mcp.CallToolRequest, 
 		},
 	}, ImputeResult{Status: "success", Message: summary}, nil
 }
+
+// GetTopicsArgs defines input schema for the get_topics tool.
+type GetTopicsArgs struct {
+	ConfigPath string `json:"config_path,omitempty" jsonschema:"Optional path to the config file (default: data/db/config.db)"`
+	Details    bool   `json:"details,omitempty" jsonschema:"Optional flag to fetch name and description details for each topic"`
+}
+
+// GetTopicsResult defines output schema for the get_topics tool.
+type GetTopicsResult struct {
+	Markdown string `json:"markdown" jsonschema:"Markdown representation of the topics table"`
+}
+
+// handleGetTopics queries OpenAlex for topic groups and formats them into a markdown table.
+func (s *MCPServer) handleGetTopics(ctx context.Context, req *mcp.CallToolRequest, args GetTopicsArgs) (*mcp.CallToolResult, GetTopicsResult, error) {
+	configPath := args.ConfigPath
+	if configPath == "" {
+		configPath = "data/db/config.db"
+	}
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		errStr := "failed to load config: " + err.Error()
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: errStr},
+			},
+			IsError: true,
+		}, GetTopicsResult{Markdown: ""}, nil
+	}
+
+	keywords := cfg.Keywords
+	if errs := openalex.ValidateKeywords(keywords); len(errs) > 0 {
+		errStr := "keyword validation failed: " + strings.Join(errs, "; ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: errStr},
+			},
+			IsError: true,
+		}, GetTopicsResult{Markdown: ""}, nil
+	}
+	topics := cfg.Topics
+
+	client := openalex.NewClient(cfg.API.Keys, cfg.API.Email, cfg.Collection.PerPage, cfg.Collection.ConcurrentRequests, cfg.Collection.MaxRetries, cfg.Collection.RetryDelay)
+
+	// Build the OpenAlex filter
+	parts := []string{"title_and_abstract.search:" + keywords}
+	if len(topics) > 0 {
+		parts = append(parts, "primary_topic.id:"+strings.Join(topics, "|"))
+	}
+	dateFrom := cfg.Filters.DateFrom
+	if dateFrom == "" {
+		dateFrom = "2003-01-01"
+	}
+	dateTo := cfg.Filters.DateTo
+	if dateTo == "" {
+		dateTo = "2024-12-31"
+	}
+	parts = append(parts, "from_publication_date:"+dateFrom)
+	parts = append(parts, "to_publication_date:"+dateTo)
+	if len(cfg.Filters.DocTypes) > 0 {
+		parts = append(parts, "type:"+strings.Join(cfg.Filters.DocTypes, "|"))
+	}
+	filter := strings.Join(parts, ",")
+
+	// Fetch all topic groups using cursor pagination
+	var allGroups []openalex.GroupByItem
+	cursor := "*"
+	for {
+		resp, err := client.FetchGroupBy(ctx, filter, "primary_topic.id", cursor)
+		if err != nil {
+			errStr := "OpenAlex request failed: " + err.Error()
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: errStr},
+				},
+				IsError: true,
+			}, GetTopicsResult{Markdown: ""}, nil
+		}
+		if resp == nil || len(resp.GroupBy) == 0 {
+			break
+		}
+		allGroups = append(allGroups, resp.GroupBy...)
+		if resp.Meta.NextCursor == "" || resp.Meta.NextCursor == cursor {
+			break
+		}
+		cursor = resp.Meta.NextCursor
+	}
+
+	if len(allGroups) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "No topics found matching the current keyword configurations."},
+			},
+		}, GetTopicsResult{Markdown: "No topics found."}, nil
+	}
+
+	// Sort groups by count descending
+	sort.Slice(allGroups, func(i, j int) bool {
+		return allGroups[i].Count > allGroups[j].Count
+	})
+
+	// Calculate total papers
+	var totalPapers int
+	for _, g := range allGroups {
+		totalPapers += g.Count
+	}
+
+	type EnrichedTopic struct {
+		TopicID     string
+		DisplayName string
+		Description string
+		Count       int
+		Percentage  float64
+	}
+
+	enriched := make([]EnrichedTopic, len(allGroups))
+	var wg sync.WaitGroup
+
+	for i, g := range allGroups {
+		wg.Add(1)
+		go func(idx int, item openalex.GroupByItem) {
+			defer wg.Done()
+
+			percentage := 0.0
+			if totalPapers > 0 {
+				percentage = float64(item.Count) / float64(totalPapers) * 100
+			}
+
+			topicID := item.Key
+			if lastSlash := strings.LastIndex(topicID, "/"); lastSlash != -1 {
+				topicID = topicID[lastSlash+1:]
+			}
+
+			eTopic := EnrichedTopic{
+				TopicID:     topicID,
+				DisplayName: item.KeyDisplayName,
+				Count:       item.Count,
+				Percentage:  percentage,
+			}
+
+			if args.Details {
+				details, err := client.FetchTopicDetails(ctx, topicID)
+				if err == nil && details != nil {
+					if details.DisplayName != "" {
+						eTopic.DisplayName = details.DisplayName
+					}
+					eTopic.Description = details.Description
+				}
+			}
+
+			enriched[idx] = eTopic
+		}(i, g)
+	}
+	wg.Wait()
+
+	// Format results into a markdown table
+	var md strings.Builder
+	md.WriteString(fmt.Sprintf("## Topics found in search results (%d topics, %d papers total)\n\n", len(enriched), totalPapers))
+	md.WriteString("| Topic ID | Topic Name | Description | Paper Count | Percentage |\n")
+	md.WriteString("| :--- | :--- | :--- | :---: | :---: |\n")
+
+	for _, t := range enriched {
+		desc := t.Description
+		if len(desc) > 80 {
+			desc = desc[:77] + "..."
+		}
+		if desc == "" {
+			desc = "—"
+		}
+		md.WriteString(fmt.Sprintf("| `%s` | %s | %s | %d | %.2f%% |\n", t.TopicID, t.DisplayName, desc, t.Count, t.Percentage))
+	}
+
+	markdownStr := md.String()
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: markdownStr},
+		},
+	}, GetTopicsResult{Markdown: markdownStr}, nil
+}
+
+func normalizeDOI(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.ToLower(s)
+	for _, prefix := range []string{"https://doi.org/", "http://doi.org/", "doi:"} {
+		if strings.HasPrefix(s, prefix) {
+			s = s[len(prefix):]
+			break
+		}
+	}
+	return s
+}
+
