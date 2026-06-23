@@ -232,3 +232,87 @@ func TestDownloadPapers(t *testing.T) {
 		t.Error("expected download progress file to be deleted")
 	}
 }
+
+func TestFetchGroupBy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("group_by") != "primary_topic.id" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"group_by":[{"key":"https://openalex.org/T10001","key_display_name":"Topic 1","count":10}],"meta":{"count":1,"next_cursor":""}}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(nil, "test@example.com", 200, 2, 2, 1)
+	client.baseURL = server.URL
+
+	resp, err := client.FetchGroupBy(context.Background(), "filter", "primary_topic.id", "*")
+	if err != nil {
+		t.Fatalf("FetchGroupBy failed: %v", err)
+	}
+	if len(resp.GroupBy) != 1 || resp.GroupBy[0].Key != "https://openalex.org/T10001" || resp.GroupBy[0].Count != 10 {
+		t.Errorf("unexpected group_by results: %+v", resp.GroupBy)
+	}
+}
+
+func TestFetchTopicDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/T10001") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"id":"https://openalex.org/T10001","display_name":"Topic 1","description":"Test Topic","keywords":["kw1","kw2"],"domain":{"display_name":"Domain 1"},"field":{"display_name":"Field 1"},"subfield":{"display_name":"Subfield 1"}}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(nil, "test@example.com", 200, 2, 2, 1)
+	client.baseURL = server.URL
+
+	details, err := client.FetchTopicDetails(context.Background(), "T10001")
+	if err != nil {
+		t.Fatalf("FetchTopicDetails failed: %v", err)
+	}
+	if details.DisplayName != "Topic 1" || details.Description != "Test Topic" || details.Domain.DisplayName != "Domain 1" {
+		t.Errorf("unexpected topic details: %+v", details)
+	}
+}
+
+func TestClientWithAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/works" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// Verify that api_key query param is present and correct
+		apiKey := r.URL.Query().Get("api_key")
+		if apiKey != "test-api-key-123" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error": "invalid api key: %s"}`, apiKey)
+			return
+		}
+		// Verify that User-Agent header is set
+		userAgent := r.Header.Get("User-Agent")
+		if userAgent != "mailto:test@example.com" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(w, `{"error": "invalid user agent"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"meta":{"count":50},"results":[]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{"test-api-key-123"}, "test@example.com", 200, 2, 2, 1)
+	client.baseURL = server.URL
+
+	count, err := client.GetTotalCount(context.Background(), "title_and_abstract.search:quantum")
+	if err != nil {
+		t.Fatalf("GetTotalCount failed: %v", err)
+	}
+	if count != 50 {
+		t.Errorf("expected 50, got %d", count)
+	}
+}
+

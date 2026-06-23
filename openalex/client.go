@@ -226,7 +226,9 @@ func (c *OpenAlexClient) doRequest(ctx context.Context, req *http.Request) ([]by
 		currReq := req.Clone(ctx)
 		currReq.Header.Set("User-Agent", "mailto:"+c.email)
 		if key != "" {
-			currReq.Header.Set("api_key", key)
+			q := currReq.URL.Query()
+			q.Set("api_key", key)
+			currReq.URL.RawQuery = q.Encode()
 		}
 
 		resp, err := c.httpClient.Do(currReq)
@@ -828,3 +830,106 @@ func ValidateTopicsExist(ctx context.Context, client *OpenAlexClient, topicIDs [
 
 	return results, nil
 }
+
+type GroupByItem struct {
+	Key            string `json:"key"`
+	KeyDisplayName string `json:"key_display_name"`
+	Count          int    `json:"count"`
+}
+
+type GroupByResponse struct {
+	GroupBy []GroupByItem `json:"group_by"`
+	Meta    struct {
+		Count      int    `json:"count"`
+		NextCursor string `json:"next_cursor"`
+	} `json:"meta"`
+}
+
+type TopicDetails struct {
+	ID          string   `json:"id"`
+	DisplayName string   `json:"display_name"`
+	Description string   `json:"description"`
+	Keywords    []string `json:"keywords"`
+	Domain      struct {
+		DisplayName string `json:"display_name"`
+	} `json:"domain"`
+	Field       struct {
+		DisplayName string `json:"display_name"`
+	} `json:"field"`
+	Subfield    struct {
+		DisplayName string `json:"display_name"`
+	} `json:"subfield"`
+}
+
+// FetchGroupBy queries OpenAlex works endpoint with a group_by parameter.
+func (c *OpenAlexClient) FetchGroupBy(ctx context.Context, apiFilter string, groupBy string, cursor string) (*GroupByResponse, error) {
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = "https://api.openalex.org"
+	}
+	u, err := url.Parse(baseURL + "/works")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("filter", apiFilter)
+	q.Set("group_by", groupBy)
+	q.Set("per_page", "200")
+	q.Set("cursor", cursor)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	c.semaphore <- struct{}{}
+	defer func() { <-c.semaphore }()
+
+	body, err := c.doRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp GroupByResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// FetchTopicDetails retrieves details for a single topic.
+func (c *OpenAlexClient) FetchTopicDetails(ctx context.Context, topicID string) (*TopicDetails, error) {
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = "https://api.openalex.org"
+	}
+	// Clean the topic ID if it is a full URL
+	cleanID := topicID
+	if idx := strings.LastIndex(topicID, "/"); idx != -1 {
+		cleanID = topicID[idx+1:]
+	}
+
+	urlStr := fmt.Sprintf("%s/topics/%s", baseURL, cleanID)
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	c.semaphore <- struct{}{}
+	defer func() { <-c.semaphore }()
+
+	body, err := c.doRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var details TopicDetails
+	if err := json.Unmarshal(body, &details); err != nil {
+		return nil, err
+	}
+
+	return &details, nil
+}
+
