@@ -279,3 +279,40 @@ func TestFetchTopicDetails(t *testing.T) {
 	}
 }
 
+func TestClientWithAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/works" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// Verify that api_key query param is present and correct
+		apiKey := r.URL.Query().Get("api_key")
+		if apiKey != "test-api-key-123" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error": "invalid api key: %s"}`, apiKey)
+			return
+		}
+		// Verify that User-Agent header is set
+		userAgent := r.Header.Get("User-Agent")
+		if userAgent != "mailto:test@example.com" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(w, `{"error": "invalid user agent"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"meta":{"count":50},"results":[]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient([]string{"test-api-key-123"}, "test@example.com", 200, 2, 2, 1)
+	client.baseURL = server.URL
+
+	count, err := client.GetTotalCount(context.Background(), "title_and_abstract.search:quantum")
+	if err != nil {
+		t.Fatalf("GetTotalCount failed: %v", err)
+	}
+	if count != 50 {
+		t.Errorf("expected 50, got %d", count)
+	}
+}
+

@@ -46,12 +46,16 @@ type ValidateResult struct {
 
 // SearchArgs defines the input schema for the search tool.
 type SearchArgs struct {
-	ConfigPath string `json:"config_path,omitempty" jsonschema:"Optional path to the collection.yml config file (default: config/collection.yml)"`
+	ConfigPath   string `json:"config_path,omitempty" jsonschema:"Optional path to the collection.yml config file (default: config/collection.yml)"`
+	CheckAnchors bool   `json:"check_anchors,omitempty" jsonschema:"Optional flag to check anchor DOI coverage (default: false)"`
 }
 
 // SearchResult defines the output schema for the search tool.
 type SearchResult struct {
-	TotalCount int `json:"total_count" jsonschema:"The total number of academic papers matching the query parameters in OpenAlex"`
+	TotalCount     int      `json:"total_count" jsonschema:"The total number of academic papers matching the query parameters in OpenAlex"`
+	AnchorsTotal   int      `json:"anchors_total,omitempty" jsonschema:"Total number of anchors checked"`
+	AnchorsMatched int      `json:"anchors_matched,omitempty" jsonschema:"Number of anchors found in search results"`
+	AnchorsMissing []string `json:"anchors_missing,omitempty" jsonschema:"List of anchor DOIs missing from search results"`
 }
 
 // DownloadArgs defines the input schema for the download tool.
@@ -220,6 +224,15 @@ func (s *MCPServer) handleSearch(ctx context.Context, req *mcp.CallToolRequest, 
 	}
 
 	keywords := cfg.Keywords
+	if errs := openalex.ValidateKeywords(keywords); len(errs) > 0 {
+		errStr := "keyword validation failed: " + strings.Join(errs, "; ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: errStr},
+			},
+			IsError: true,
+		}, SearchResult{TotalCount: 0}, nil
+	}
 	topics := cfg.Topics
 
 	client := openalex.NewClient(cfg.API.Keys, cfg.API.Email, cfg.Collection.PerPage, cfg.Collection.ConcurrentRequests, cfg.Collection.MaxRetries, cfg.Collection.RetryDelay)
@@ -255,11 +268,68 @@ func (s *MCPServer) handleSearch(ctx context.Context, req *mcp.CallToolRequest, 
 		}, SearchResult{TotalCount: 0}, nil
 	}
 
+	var anchors []string
+	var matchedCount int
+	var missingDOIs []string
+
+	if args.CheckAnchors {
+		for _, a := range cfg.Anchors {
+			norm := normalizeDOI(a)
+			if norm != "" {
+				anchors = append(anchors, norm)
+			}
+		}
+
+		if len(anchors) > 0 {
+			batchSize := 10
+			matchedSet := make(map[string]bool)
+
+			for i := 0; i < len(anchors); i += batchSize {
+				end := i + batchSize
+				if end > len(anchors) {
+					end = len(anchors)
+				}
+				batch := anchors[i:end]
+				batchFilter := strings.Join(batch, "|")
+
+				combinedFilter := filter + ",doi:" + batchFilter
+
+				resp, err := client.FetchPage(ctx, combinedFilter, "*")
+				if err == nil && resp != nil {
+					for _, w := range resp.Results {
+						norm := normalizeDOI(w.DOI)
+						if norm != "" {
+							matchedSet[norm] = true
+						}
+					}
+				}
+			}
+
+			for _, doi := range anchors {
+				if matchedSet[doi] {
+					matchedCount++
+				} else {
+					missingDOIs = append(missingDOIs, doi)
+				}
+			}
+		}
+	}
+
+	text := fmt.Sprintf("Found %d papers matching configuration filters in OpenAlex.", count)
+	if args.CheckAnchors {
+		text += fmt.Sprintf(" Anchor match coverage: %d/%d matches.", matchedCount, len(anchors))
+	}
+
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
-			&mcp.TextContent{Text: fmt.Sprintf("Found %d papers matching configuration filters in OpenAlex.", count)},
+			&mcp.TextContent{Text: text},
 		},
-	}, SearchResult{TotalCount: count}, nil
+	}, SearchResult{
+		TotalCount:     count,
+		AnchorsTotal:   len(anchors),
+		AnchorsMatched: matchedCount,
+		AnchorsMissing: missingDOIs,
+	}, nil
 }
 
 // handleDownload downloads papers matching query filters concurrently and saves them to JSONL.
@@ -535,6 +605,15 @@ func (s *MCPServer) handleGetTopics(ctx context.Context, req *mcp.CallToolReques
 	}
 
 	keywords := cfg.Keywords
+	if errs := openalex.ValidateKeywords(keywords); len(errs) > 0 {
+		errStr := "keyword validation failed: " + strings.Join(errs, "; ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: errStr},
+			},
+			IsError: true,
+		}, GetTopicsResult{Markdown: ""}, nil
+	}
 	topics := cfg.Topics
 
 	client := openalex.NewClient(cfg.API.Keys, cfg.API.Email, cfg.Collection.PerPage, cfg.Collection.ConcurrentRequests, cfg.Collection.MaxRetries, cfg.Collection.RetryDelay)
@@ -674,5 +753,17 @@ func (s *MCPServer) handleGetTopics(ctx context.Context, req *mcp.CallToolReques
 			&mcp.TextContent{Text: markdownStr},
 		},
 	}, GetTopicsResult{Markdown: markdownStr}, nil
+}
+
+func normalizeDOI(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.ToLower(s)
+	for _, prefix := range []string{"https://doi.org/", "http://doi.org/", "doi:"} {
+		if strings.HasPrefix(s, prefix) {
+			s = s[len(prefix):]
+			break
+		}
+	}
+	return s
 }
 

@@ -226,7 +226,9 @@ func (c *OpenAlexClient) doRequest(ctx context.Context, req *http.Request) ([]by
 		currReq := req.Clone(ctx)
 		currReq.Header.Set("User-Agent", "mailto:"+c.email)
 		if key != "" {
-			currReq.Header.Set("api_key", key)
+			q := currReq.URL.Query()
+			q.Set("api_key", key)
+			currReq.URL.RawQuery = q.Encode()
 		}
 
 		resp, err := c.httpClient.Do(currReq)
